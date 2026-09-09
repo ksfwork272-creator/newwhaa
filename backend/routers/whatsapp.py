@@ -1,4 +1,5 @@
 import os
+import httpx
 from fastapi import APIRouter, Depends, Request, HTTPException
 from pydantic import BaseModel
 
@@ -82,6 +83,18 @@ async def disconnect(rid: str = Depends(get_current_restaurant_id)):
     status = await (await get_whatsapp_provider(rid)).disconnect()
     await db.whatsapp_connections.update_one({"restaurant_id": rid}, {"$set": {"status": status.status, "connected_number": None}})
     return _public(await _get_conn(rid))
+
+
+@router.get("/gateway-health")
+async def gateway_health(rid: str = Depends(get_current_restaurant_id)):
+    url = (os.environ.get("WHATSAPP_GATEWAY_URL") or "http://localhost:3001").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=3) as http:
+            resp = await http.get(f"{url}/health")
+            ok = resp.status_code == 200 and resp.json().get("ok") is True
+    except Exception:
+        ok = False
+    return {"ok": ok, "checked_at": now_iso()}
 
 
 @router.get("/status")

@@ -23,7 +23,6 @@ export default function Login() {
     catch (err) { setError(err instanceof ApiError ? formatApiError(err.body) : "Unable to sign in"); }
     finally { setLoading(false); }
   };
-  const fill = (email: string, pass: string) => { setIdentifier(email); setPassword(pass); };
   return <div data-testid="login-page" className="min-h-screen bg-background text-foreground lg:grid lg:grid-cols-[.95fr_1.05fr]">
     <section className="relative hidden overflow-hidden bg-[#0D1111] p-12 text-white lg:flex lg:flex-col lg:justify-between">
       <img src={HERO} alt="Professional restaurant kitchen" className="absolute inset-0 h-full w-full object-cover" />
@@ -54,13 +53,6 @@ export default function Login() {
         <div><Label htmlFor="password">Password</Label><Input id="password" data-testid="login-password-input" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" required className="h-11" /></div>
         {error && <p data-testid="auth-error" className="text-sm text-rose-600">{error}</p>}
         <Button type="submit" data-testid="login-submit-button" disabled={loading} className="h-11 w-full gap-2 rounded-full bg-primary shadow-lg shadow-primary/25 transition-transform duration-200 hover:-translate-y-0.5">{loading ? <Loader2 className="animate-spin" /> : <>Sign in <ArrowRight size={16} /></>}</Button>
-        <div className="rounded-2xl border border-border/60 bg-card p-4">
-          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Quick demo access</p>
-          <div className="mt-3 grid gap-2">
-            <button type="button" data-testid="demo-owner-fill" onClick={() => fill("owner@pizzapalace.pk", "palace123")} className="flex items-center justify-between rounded-xl border border-border/60 px-3 py-2.5 text-left text-sm transition-colors hover:border-primary/40 hover:bg-muted"><span><span className="font-semibold">Restaurant demo</span><span className="block text-xs text-muted-foreground">owner@pizzapalace.pk</span></span><Pizza size={16} className="text-primary" /></button>
-            <button type="button" data-testid="demo-admin-fill" onClick={() => fill("admin@restaurantai.pk", "ChangeMe@2026")} className="flex items-center justify-between rounded-xl border border-border/60 px-3 py-2.5 text-left text-sm transition-colors hover:border-primary/40 hover:bg-muted"><span><span className="font-semibold">Super Admin</span><span className="block text-xs text-muted-foreground">admin@restaurantai.pk</span></span><ShieldCheck size={16} className="text-primary" /></button>
-          </div>
-        </div>
       </form>
     </section>
   </div>;

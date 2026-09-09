@@ -4,6 +4,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 from database import NO_ID, db
@@ -11,6 +12,22 @@ from services import order_service
 
 logger = logging.getLogger(__name__)
 FALLBACK = "Sorry, I'm having a little trouble right now. Please try again or ask our team for help."
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+GEMINI_DEFAULT_MODEL = "gemini-3-flash-preview"
+
+
+def resolve_llm(ai_settings: dict) -> tuple[str, str, str]:
+    """Returns (provider, api_key, model). Tenant key wins; platform env key is the fallback."""
+    provider = (ai_settings.get("provider") or "tabiai").lower()
+    tenant_key = (ai_settings.get("api_key") or "").strip()
+    model = (ai_settings.get("model") or "").strip()
+    if provider == "gemini":
+        if not model or not model.startswith("gemini"):
+            model = os.environ.get("AI_MODEL", GEMINI_DEFAULT_MODEL)
+        return "gemini", tenant_key or os.environ.get("EMERGENT_LLM_KEY", ""), model
+    if not model or model.startswith("gemini"):
+        model = os.environ.get("TABIAI_MODEL", "claude-opus-5")
+    return "tabiai", tenant_key or os.environ.get("TABIAI_API_KEY", ""), model
 TOOLS = [{"type": "function", "function": {"name": "add_to_cart", "description": "Add a menu item by name.",
           "parameters": {"type": "object", "properties": {"item_name": {"type": "string"}, "quantity": {"type": "integer"}}, "required": ["item_name"]}}},
          {"type": "function", "function": {"name": "remove_from_cart", "description": "Remove an item by name.", "parameters": {"type": "object", "properties": {"item_name": {"type": "string"}}, "required": ["item_name"]}}},
@@ -106,6 +123,16 @@ async def _dispatch(name, args, restaurant, items, conversation_id, customer):
             return {"error": "name_missing"}
         if totals()["subtotal"] < float(restaurant.get("min_order", 0)):
             return {"error": "below_minimum", "minimum": restaurant.get("min_order")}
+        recent = await db.orders.find_one({"conversation_id": conversation_id}, NO_ID, sort=[("created_at", -1)])
+        if recent:
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(recent["created_at"])).total_seconds()
+            except Exception:
+                age = None
+            same_items = sorted((i["item_id"], int(i["qty"])) for i in recent.get("items", [])) == sorted((c["item_id"], int(c["qty"])) for c in cart)
+            if age is not None and age < 120 and same_items:
+                return {"ok": True, "duplicate_prevented": True, "order_number": recent["order_number"], "total": recent["total"],
+                        "note": "This exact order was already placed moments ago. Do NOT place it again — tell the customer their order is already confirmed with this order number."}
         order = await order_service.create_order(restaurant=restaurant, conversation=conversation, customer=customer)
         await db.conversations.update_one({"id": conversation_id}, {"$set": {"cart": [], "state": "ORDER_PLACED", "last_order_number": order["order_number"], "last_order_id": order["id"]}})
         return {"_order_created": True, "order": order, "order_number": order["order_number"], "total": order["total"]}
@@ -131,29 +158,91 @@ async def _dispatch(name, args, restaurant, items, conversation_id, customer):
     return {"error": "unknown_tool"}
 
 
-async def generate_reply(*, restaurant, ai_settings, conversation, customer, categories, items, recent_messages, incoming_text):
-    try:
-        chat = (LlmChat(api_key=os.environ["EMERGENT_LLM_KEY"], session_id=conversation["id"],
-                        system_message=_system_prompt(restaurant, ai_settings, conversation, customer, categories, items, recent_messages))
-                .with_model("gemini", ai_settings.get("model") or os.environ.get("AI_MODEL", "gemini-3-flash-preview"))
-                .with_tools(TOOLS, tool_choice="auto"))
-        response = await chat.send_message_with_tools(UserMessage(text=incoming_text))
-        created_order = None
-        for _ in range(6):
-            if not getattr(response, "tool_calls", None):
-                break
-            for tool_call in response.tool_calls:
+async def _tabiai_reply(*, api_key, model, system_prompt, incoming_text, restaurant, items, conversation_id, customer):
+    base = (os.environ.get("TABIAI_BASE_URL") or "https://tabitoken.com/v1").rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": incoming_text}]
+    created_order, content = None, ""
+    async with httpx.AsyncClient(timeout=90) as http:
+        for _ in range(7):
+            resp = await http.post(f"{base}/chat/completions", headers=headers,
+                                   json={"model": model, "messages": messages, "tools": TOOLS, "tool_choice": "auto", "max_tokens": 1024})
+            resp.raise_for_status()
+            message = resp.json()["choices"][0]["message"]
+            content = (message.get("content") or "").strip()
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                return content, created_order
+            messages.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": tool_calls})
+            for tool_call in tool_calls:
+                fn = tool_call.get("function", {})
                 try:
-                    args = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(tool_call.arguments or "{}")
+                    args = json.loads(fn.get("arguments") or "{}")
                 except Exception:
                     args = {}
-                result = await _dispatch(tool_call.name, args, restaurant, items, conversation["id"], customer)
+                result = await _dispatch(fn.get("name"), args, restaurant, items, conversation_id, customer)
                 if result.get("_order_created"):
                     created_order = result.pop("order")
                     result.pop("_order_created", None)
-                chat.add_tool_result(tool_call.id, json.dumps(result, default=str))
-            response = await chat.send_message_with_tools()
-        return ((response.content or "").strip() or "Ji, main aap ki kya madad kar sakta hoon?"), created_order
+                messages.append({"role": "tool", "tool_call_id": tool_call.get("id"), "content": json.dumps(result, default=str)})
+    return content, created_order
+
+
+async def _gemini_reply(*, api_key, model, system_prompt, incoming_text, restaurant, items, conversation_id, customer):
+    chat = (LlmChat(api_key=api_key, session_id=conversation_id, system_message=system_prompt)
+            .with_model("gemini", model)
+            .with_tools(TOOLS, tool_choice="auto"))
+    response = await chat.send_message_with_tools(UserMessage(text=incoming_text))
+    created_order = None
+    for _ in range(6):
+        if not getattr(response, "tool_calls", None):
+            break
+        for tool_call in response.tool_calls:
+            try:
+                args = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(tool_call.arguments or "{}")
+            except Exception:
+                args = {}
+            result = await _dispatch(tool_call.name, args, restaurant, items, conversation_id, customer)
+            if result.get("_order_created"):
+                created_order = result.pop("order")
+                result.pop("_order_created", None)
+            chat.add_tool_result(tool_call.id, json.dumps(result, default=str))
+        response = await chat.send_message_with_tools()
+    return (response.content or "").strip(), created_order
+
+
+async def generate_reply(*, restaurant, ai_settings, conversation, customer, categories, items, recent_messages, incoming_text):
+    provider, api_key, model = resolve_llm(ai_settings)
+    system_prompt = _system_prompt(restaurant, ai_settings, conversation, customer, categories, items, recent_messages)
+    kwargs = dict(api_key=api_key, model=model, system_prompt=system_prompt, incoming_text=incoming_text,
+                  restaurant=restaurant, items=items, conversation_id=conversation["id"], customer=customer)
+    try:
+        reply, created_order = await (_tabiai_reply(**kwargs) if provider == "tabiai" else _gemini_reply(**kwargs))
+        return (reply or "Ji, main aap ki kya madad kar sakta hoon?"), created_order
     except Exception as exc:
-        logger.exception("AI generate_reply failed: %s", exc)
+        logger.exception("AI generate_reply failed (provider=%s model=%s): %s", provider, model, exc)
         return FALLBACK, None
+
+
+async def test_connection(ai_settings: dict) -> dict:
+    provider, api_key, model = resolve_llm(ai_settings)
+    if not api_key:
+        return {"ok": False, "provider": provider, "model": model, "detail": "No API key configured for this provider."}
+    try:
+        if provider == "tabiai":
+            base = (os.environ.get("TABIAI_BASE_URL") or "https://tabitoken.com/v1").rstrip("/")
+            async with httpx.AsyncClient(timeout=45) as http:
+                resp = await http.post(f"{base}/chat/completions",
+                                       headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": BROWSER_UA},
+                                       json={"model": model, "messages": [{"role": "user", "content": "Reply with the single word: ok"}], "max_tokens": 10})
+                resp.raise_for_status()
+                reply = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        else:
+            chat = LlmChat(api_key=api_key, session_id="settings-test", system_message="You are a connection test.").with_model("gemini", model)
+            reply = ((await chat.send_message(UserMessage(text="Reply with the single word: ok"))) or "").strip()
+        return {"ok": True, "provider": provider, "model": model, "detail": reply[:80] or "connected"}
+    except httpx.HTTPStatusError as exc:
+        return {"ok": False, "provider": provider, "model": model, "detail": f"Provider returned {exc.response.status_code} — check API key and model name."}
+    except Exception as exc:
+        logger.warning("AI test_connection failed: %s", exc)
+        return {"ok": False, "provider": provider, "model": model, "detail": "Connection failed — check API key, model name and network."}
